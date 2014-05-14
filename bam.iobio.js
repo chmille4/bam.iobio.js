@@ -24,12 +24,10 @@ var Bam = Class.extend({
       // set iobio servers
       this.iobio = {}
       this.iobio.bamtools = "ws://bamtools.iobio.io";
-      // this.iobio.samtools = "ws://samtools.iobio.io";
-      this.iobio.samtools = "ws://0.0.0.0:8060";
+      this.iobio.samtools = "ws://samtools.iobio.io";
+      this.iobio.bamReadDepther = "ws://bamReadDepther.iobio.io";
       this.iobio.bamMerger = "ws://bammerger.iobio.io";
-      // this.iobio.bamstatsAlive = "ws://bamstatsalive.iobio.io"
-      this.iobio.bamstatsAlive = "ws://0.0.0.0:7100";
-      
+      this.iobio.bamstatsAlive = "ws://bamstatsalive.iobio.io"
       return this;
    },
    
@@ -101,6 +99,82 @@ var Bam = Class.extend({
       return encodeURI(url);
    },
    
+   _generateExomeBed: function(id) {
+      var bed = "";
+      var readDepth = this.readDepth[id];
+      var start, end;
+      var sum =0;
+      // for (var i=0; i < readDepth.length; i++){
+      //    sum += readDepth[i].depth;
+      // }
+      // console.log("avg = " + parseInt(sum / readDepth.length));
+      // merge contiguous blocks into a single block and convert to bed format
+      for( var i=0; i < readDepth.length; i++){
+         if (readDepth[i].depth < 20) {
+            if (start != undefined)
+               bed += id + "\t" + start + "\t" + end + "\t.\t.\t.\t.\t.\t.\t.\t.\t.\n"
+            start = undefined;
+         }
+         else {         
+            if (start == undefined) start = readDepth[i].pos;
+            end = readDepth[i].pos + 16384;
+         }
+      }
+      // add final record if data stopped on non-zero
+      if (start != undefined)
+         bed += id + "\t" + start + "\t" + end + "\t.\t.\t.\t.\t.\t.\t.\t.\t.\n"
+      return bed;
+   },
+   
+   _mapToBedCoordinates: function(ref, regions, bed) {
+      var a = this._bedToCoordinateArray(ref, bed);
+      var a_i = 0;
+      var bedRegions = [];
+      if (a.length == 0) {
+         alert("Bed file doesn't have coordinates for reference: " + regions[0].name + ". Sampling normally");
+         return null;
+      }
+      regions.forEach(function(reg){
+         for (a_i; a_i < a.length; a_i++) {
+            if (a[a_i].end > reg.end)
+               break;
+            
+            if (a[a_i].start >= reg.start)
+               bedRegions.push( {name:reg.name, start:a[a_i].start, end:a[a_i].end})
+         }
+      }) 
+      return bedRegions
+   },
+   
+   _bedToCoordinateArray: function(ref, bed) {
+      var a = [];
+      bed.split("\n").forEach(function(line){
+        if (line[0] == '#' || line == "") return;
+  
+        var fields = line.split("\t");
+        if (fields[0] == ref)
+           a.push({ chr:fields[0], start:parseInt(fields[1]), end:parseInt(fields[2]) });
+      });
+      return a;
+   },
+   
+   _getClosestValueIndex: function(a, x) {
+       var lo = -1, hi = a.length;
+       while (hi - lo > 1) {
+           var mid = Math.round((lo + hi)/2);
+           if (a[mid].start <= x) {
+               lo = mid;
+           } else {
+               hi = mid;
+           }
+       }
+       if (lo == -1 ) return 0;
+       if ( a[lo].end > x )
+           return lo;
+       else
+           return hi;
+   },
+   
    getReferencesWithReads: function(callback) {
       var refs = [];
       var me = this;
@@ -150,6 +224,111 @@ var Bam = Class.extend({
       // Filters BAM file(s) by user-specified criteria
    },
    
+   estimateBaiReadDepth: function(callback) {      
+      var me = this, readDepth = {};
+      me.readDepth = {};
+      
+      function cb() {
+         if (me.header) {
+            for (var id in readDepth) {
+              if (readDepth.hasOwnProperty(id))
+              var name = me.header.sq[parseInt(id)].name;
+               if ( me.readDepth[ name ] == undefined){
+                  me.readDepth[ name ] = readDepth[id];
+                  callback( name, readDepth[id] );
+               }                
+            }  
+         }
+      }
+            
+      me.getHeader(function(header) { 
+         if (Object.keys(me.readDepth).length > 0)
+            cb();
+      });
+      if ( Object.keys(me.readDepth).length > 0 )
+         callback(me.readDepth)
+      else if (me.sourceType == 'url') {
+         var client = BinaryClient(me.iobio.bamReadDepther);
+         var url = encodeURI( me.iobio.bamReadDepther + '?cmd=-i ' + me.bamUri + ".bai")
+         client.on('open', function(stream){
+            var stream = client.createStream({event:'run', params : {'url':url}});
+            var currentSequence;
+            stream.on('data', function(data, options) {
+               data = data.split("\n");
+               for (var i=0; i < data.length; i++)  {
+                  if ( data[i][0] == '#' ) {
+                     if ( Object.keys(readDepth).length > 0 ) { cb() };
+                     currentSequence = data[i].substr(1);
+                     readDepth[currentSequence] = [];
+                  }
+                  else {
+                     if (data[i] != "") {
+                        var d = data[i].split("\t");
+                        readDepth[currentSequence].push({ pos:parseInt(d[0]), depth:parseInt(d[1]) });
+                     }
+                  }                  
+               }
+            });
+            stream.on('end', function() {
+               cb();
+            });
+         });
+      } else if (me.sourceType == 'file') {
+          me.baiBlob.fetch(function(header){
+             if (!header) {
+                  return dlog("Couldn't access BAI");
+              }
+          
+              var uncba = new Uint8Array(header);
+              var baiMagic = readInt(uncba, 0);
+              if (baiMagic != BAI_MAGIC) {
+                  return dlog('Not a BAI file');
+              }
+              var nref = readInt(uncba, 4);
+          
+              bam.indices = [];
+              var p = 8;
+              
+              for (var ref = 0; ref < nref; ++ref) {
+                  var bins = [];
+                  var blockStart = p;
+                  var nbin = readInt(uncba, p); p += 4;
+                  if (nbin > 0) readDepth[ref] = [];
+                  for (var b = 0; b < nbin; ++b) {
+                      var bin = readInt(uncba, p);
+                      var nchnk = readInt(uncba, p+4);
+                      p += 8;
+                      // p += 8 + (nchnk * 16);
+                      var byteCount = 0;
+                      for (var c=0; c < nchnk; ++c) {
+                         var startBlockAddress = readVob(uncba, p);
+                         var endBlockAddress = readVob(uncba, p+8);
+                         p += 16;
+                         byteCount += (endBlockAddress.block - startBlockAddress.block);
+                      }
+                     if ( bin >=  4681 && bin <= 37449) {
+                        var position = (bin - 4681) * 16384;
+                        readDepth[ref][bin-4681] = {pos:position, depth:byteCount};
+                        // readDepth[ref].push({pos:position, depth:byteCount});
+                       //bins[bin - 4681] = byteCount;
+                     }
+                  }
+                  var nintv = readInt(uncba, p); p += 4;
+                  p += (nintv * 8);
+                  
+                  if (nbin > 0) {
+                     for (var i=0 ; i < readDepth[ref].length; i++) {
+                        if(readDepth[ref][i] == undefined)
+                           readDepth[ref][i] = {pos : (i+1)*16000, depth:0};
+                     }
+                  }
+              }                       
+              cb();
+          });
+      }
+         
+   },
+   
    getHeader: function(callback) {
       var me = this;
       if (me.header)
@@ -157,17 +336,17 @@ var Bam = Class.extend({
       else if (me.sourceType == 'file')
          me.promise(function() { me.getHeader(callback); })
       else {
-         var client = BinaryClient(this.iobio.samtools);
-         var url = encodeURI( this.iobio.samtools + '?cmd=view -H ' + this.bamUri)
+         var client = BinaryClient(me.iobio.samtools);
+         var url = encodeURI( me.iobio.samtools + '?cmd=view -H ' + this.bamUri)
          client.on('open', function(stream){
             var stream = client.createStream({event:'run', params : {'url':url}});
-            var headerStr = ""
+            var rawHeader = ""
             stream.on('data', function(data, options) {
-               headerStr += data;
+               rawHeader += data;
             });
-            stream.on('end', function() { 
-               me.setHeader(headerStr)               
-               callback(me.header);
+            stream.on('end', function() {
+               me.setHeader(rawHeader);             
+               callback( me.header);
             });
          });
       }
@@ -179,11 +358,11 @@ var Bam = Class.extend({
    setHeader: function(headerStr) {
       var header = { sq:[], toStr : headerStr };
       var lines = headerStr.split("\n");
-      for ( var i=0; i<lines.length; i++) {
+      for ( var i=0; i<lines.length > 0; i++) {
          var fields = lines[i].split("\t");
          if (fields[0] == "@SQ") {
             var name = fields[1].split("SN:")[1];
-            var length = parseInt(fields[2].split("LN:")[1]);
+            var length = parseInt(fields[2].split("LN:")[1]);            
             header.sq.push({name:name, end:1+length});
          }
       }               
@@ -245,35 +424,50 @@ var Bam = Class.extend({
    sampleStats: function(callback, options) {
       // Prints some basic statistics from sampled input BAM file(s)      
       options = $.extend({
-         binSize : 10000, // defaults
-         binNumber : 50,
+         binSize : 40000, // defaults
+         binNumber : 20,
          start : 1,
       },options);
       var me = this;
       
       function goSampling(SQs) {      
          var regions = [];
+         var bedRegions;
          for (var j=0; j < SQs.length; j++) {
-            var sqStart = SQs[j].start || options.start || 1;
+            var sqStart = options.start;
             var length = SQs[j].end - sqStart;
             if ( length < options.binSize * options.binNumber) {
                regions.push(SQs[j])
             } else {
+               // create random reference coordinates              
                for (var i=0; i < options.binNumber; i++) {   
-                  
-                  var regionStart = parseInt(sqStart + length/options.binNumber * i);
-                  regions.push({
+                  var s=sqStart + parseInt(Math.random()*length); 
+                  regions.push( {
                      'name' : SQs[j].name,
-                     'start' : regionStart,
-                     'end' : regionStart + options.binSize
-                  });
+                     'start' : s,
+                     'end' : s+options.binSize
+                  }); 
                }
+               // sort by start value
+               regions = regions.sort(function(a,b) {
+                  var x = a.start; var y = b.start;
+                  return ((x < y) ? -1 : ((x > y) ? 1 : 0));
+               });               
+               
+               // intelligently determine exome bed coordinates
+               if (options.exomeSampling)
+                  options.bed = me._generateExomeBed(options.sequenceNames[0]);
+               
+               // map random region coordinates to bed coordinates
+               if (options.bed != undefined)
+                  bedRegions = me._mapToBedCoordinates(SQs[0].name, regions, options.bed)
             }
          }      
          
          var client = BinaryClient(me.iobio.bamstatsAlive);
-         var url = encodeURI( me.iobio.bamstatsAlive + '?cmd=-u 1000 -s ' + options.start + " -l " + length + " " + encodeURIComponent(me._getBamRegionsUrl(regions)));
-                  // var url = encodeURI( me.iobio.bamstatsAlive + '?cmd=-u 1000 ' + encodeURIComponent(me._getBamRegionsUrl(regions)));
+         var regStr = JSON.stringify((bedRegions || regions).map(function(d) { return {start:d.start,end:d.end,chr:d.name};}));
+         // var url = encodeURI( me.iobio.bamstatsAlive + '?cmd=-u 30000 -f 2000 -r \'' + regStr + '\' ' + encodeURIComponent(me._getBamRegionsUrl(regions)));
+         var url = encodeURI( me.iobio.bamstatsAlive + '?cmd=-u 3000 -r \'' + regStr + '\' ' + encodeURIComponent(me._getBamRegionsUrl(regions)));
          var buffer = "";
          client.on('open', function(stream){
             var stream = client.createStream({event:'run', params : {'url':url}});
@@ -291,15 +485,32 @@ var Bam = Class.extend({
                  callback(obj); 
                }               
             });
+            stream.on('end', function() {
+               if (options.onEnd != undefined)
+                  options.onEnd();
+            });
          });
       }
       
-      if ( options.sequenceNames != undefined && options.sequenceNames.length == 1 && options.start != undefined && options.end != undefined) {
-         goSampling([{name:options.sequenceNames[0], start:options.start, end:options.end}]);
-      } else  {
+      if ( options.sequenceNames != undefined && options.end != undefined) {
+         var sqs = options.sequenceNames.map(function(d) { return {name:d, end:options.end}});
+         goSampling(sqs);
+      } else  if (options.sequenceNames != undefined){
          this.getHeader(function(header){
-            goSampling(header.sq);
-         })
+            var sq = [];
+            $(header.sq).each( function(i,d) { 
+               if(options.sequenceNames.indexOf(d.name) != -1) 
+               sq.push( d ); 
+            })
+            goSampling(sq);
+         });
+      } else {
+         this.getHeader(function(header){
+            var sqs = header.sq;
+            if (options.end != undefined)
+              var sqs = options.sequenceNames.map(function(d) { return {name:d, end:options.end}});
+            goSampling(sqs); 
+         });
          // this.getReferencesWithReads(function(refs) {            
          //    goSampling(refs);
          // })

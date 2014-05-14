@@ -314,7 +314,7 @@ BamFile.prototype.readBamRecords = function(ba, offset, sink, min, max, chrId) {
         var nextRef  = readInt(ba, offset + 24);
         var nextPos = readInt(ba, offset + 28);
         
-        record.rnext = nextRef;
+        record.rnext = nextRef + 1;
         record.pnext = nextPos;
         
         var tlen = readInt(ba, offset + 32);
