@@ -300,10 +300,10 @@ var Bam = Class.extend({
                       p += 8;
                       // p += 8 + (nchnk * 16);
                       var byteCount = 0;
-                      for (var c=0; c < nchnk; ++c) {
+                      for (var c=0; c < nchnk; ++c) {                         
                          var startBlockAddress = readVob(uncba, p);
                          var endBlockAddress = readVob(uncba, p+8);
-                         p += 16;
+                         p += 16; 
                          byteCount += (endBlockAddress.block - startBlockAddress.block);
                       }
                      if ( bin >=  4681 && bin <= 37449) {
@@ -424,8 +424,8 @@ var Bam = Class.extend({
    sampleStats: function(callback, options) {
       // Prints some basic statistics from sampled input BAM file(s)      
       options = $.extend({
-         binSize : 40000, // defaults
-         binNumber : 20,
+         binSize : 60000, // defaults
+         binNumber : 30,
          start : 1,
       },options);
       var me = this;
@@ -433,36 +433,59 @@ var Bam = Class.extend({
       function goSampling(SQs) {      
          var regions = [];
          var bedRegions;
-         for (var j=0; j < SQs.length; j++) {
-            var sqStart = options.start;
-            var length = SQs[j].end - sqStart;
-            if ( length < options.binSize * options.binNumber) {
-               regions.push(SQs[j])
-            } else {
-               // create random reference coordinates              
-               for (var i=0; i < options.binNumber; i++) {   
-                  var s=sqStart + parseInt(Math.random()*length); 
-                  regions.push( {
-                     'name' : SQs[j].name,
-                     'start' : s,
-                     'end' : s+options.binSize
-                  }); 
-               }
-               // sort by start value
-               regions = regions.sort(function(a,b) {
-                  var x = a.start; var y = b.start;
-                  return ((x < y) ? -1 : ((x > y) ? 1 : 0));
-               });               
-               
-               // intelligently determine exome bed coordinates
-               if (options.exomeSampling)
-                  options.bed = me._generateExomeBed(options.sequenceNames[0]);
-               
-               // map random region coordinates to bed coordinates
-               if (options.bed != undefined)
-                  bedRegions = me._mapToBedCoordinates(SQs[0].name, regions, options.bed)
-            }
-         }      
+         var sqStart = options.start;
+         var totalLengthToSample = SQs.reduce(function(prev, curr) { return (curr.end - sqStart + prev) }, 0)
+
+         // handle small data
+         if (totalLengthToSample < options.binSize * options.binNumber)
+          return;
+         else {
+           // create random reference coordinates              
+           for (var k=0; k < options.binNumber; k++) {   
+              var start=parseInt(Math.random()*totalLengthToSample); 
+              var end = start + options.binSize;
+              var culmLength = 0;
+              for (var i=0; i < SQs.length; i++ ) {
+                var sq = SQs[i];
+                var culmStart = culmLength;
+                culmLength += sq.end - sqStart;
+                // test if start is inside this references
+                if ( start < (culmLength)) {
+                  // test if it goes into next reference
+                  if (end < (culmLength)) {
+                    regions.push( {
+                       'name' : sq.name,
+                       'start' : start-culmStart + sqStart,
+                       'end' : end - culmStart + sqStart
+                    }); 
+                    break;
+                  } else {
+                    regions.push( {
+                       'name' : sq.name,
+                       'start' : start-culmStart,
+                       'end' : end - culmStart
+                    }); 
+                    start = culmLength+1;
+                  }
+                }                
+              }
+
+           }
+           // sort by start value
+           regions = regions.sort(function(a,b) {
+              var x = a.start; var y = b.start;
+              return ((x < y) ? -1 : ((x > y) ? 1 : 0));
+           });               
+           
+           // intelligently determine exome bed coordinates **experimental**
+           if (options.exomeSampling)
+              options.bed = me._generateExomeBed(options.sequenceNames[0]);
+           
+           // map random region coordinates to bed coordinates
+           if (options.bed != undefined)
+              bedRegions = me._mapToBedCoordinates(SQs[0].name, regions, options.bed)
+        }
+           
          
          var client = BinaryClient(me.iobio.bamstatsAlive);
          var regStr = JSON.stringify((bedRegions || regions).map(function(d) { return {start:d.start,end:d.end,chr:d.name};}));
